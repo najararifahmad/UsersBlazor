@@ -1,0 +1,214 @@
+﻿@page "/users-list"
+@using UsersBlazor.DataLayer;
+@inject IJSRuntime jsRuntime
+@inject NavigationManager navigationManager
+@inject HttpClient Http
+
+<h2>Users</h2>
+
+<h5>
+    <a href="add-user">Add New User</a>
+</h5>
+
+@if (users == null)
+{
+    <p><em>Loading...</em></p>
+}
+else
+{
+
+    
+    <div class="row">
+        <div class="col-md-12">
+            <table id="productsTable" class="table table-bordered table-hover table-striped"
+                   >
+                <thead>
+                    <tr>
+                        <th>First Name</th>
+                        <th>Last Name</th>
+                        <th>Email</th>
+                        <th></th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @if (users.Count > 0)
+                    {
+                        @foreach (var user in users)
+                        {
+                            <tr>
+                                <td>@user.FirstName</td>
+                                <td>@user.LastName</td>
+                                <td>@user.Email</td>
+                                <td>
+                                    <!-- Edit the current forecast -->
+                                    <button class="btn btn-primary"
+                                    @onclick="(() => EditUser(user.ID))">
+                                        Edit
+                                    </button>
+                                </td>
+                                <td>
+                                    <!-- Edit the current forecast -->
+                                    <button class="btn btn-danger"
+                                    @onclick="(() => DeleteUser(user.ID))">
+                                        Delete
+                                    </button>
+                                </td>
+                            </tr>
+                        }
+                    }
+                    else
+                    {
+                        <tr>
+                            <td colspan="5">
+                                <h6 class="text-center">No users found!</h6>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+                <tfoot>
+                    <div class="row text-muted ">
+                        <div class="col-md-12" style="margin-left: 80%">
+                            Items Per Page:
+                            <select class="text-muted"
+                            @onchange="PageSizeChanged">
+                                <option value="5" selected="selected">5</option>
+                                <option value="10">10</option>
+                                <option value="20">20</option>
+                                <option value="50">50</option>
+                                <option value="100">100</option>
+                            </select>
+
+                            @(pageNumber * pageSize + 1) -
+                            @if (totalItems < pageSize)
+                            {
+                                <text>
+                                    @totalItems
+                                </text>
+                            }
+                            else
+                            {
+                                @if (pageNumber * pageSize + pageSize < totalItems)
+                                {
+                                    <text>
+                                        @(pageNumber * pageSize + pageSize)
+                                    </text>
+                                }
+                                else
+                                {
+                                    <text>
+                                        @totalItems
+                                    </text>
+                                }
+                            }
+                            of @totalItems
+
+                            <button class="btn btn-sm" @onclick="PreviousClicked"
+                            @attributes="previousButtonAttributes">
+                                <i class="oi oi-chevron-left" style="font-size: 10pt"></i>
+                            </button>
+
+                            <button class="btn btn-sm" @onclick="NextClicked"
+                            @attributes="nextButtonAttributes">
+                                <i class="oi oi-chevron-right" style="font-size: 10pt"></i>
+                            </button>
+                        </div>
+
+                    </div>
+                </tfoot>
+            </table>
+        </div>
+    </div>
+}
+
+
+@code {
+    List<User> users = new List<User>();
+
+    int pageNumber = 0;
+    int pageSize = 5;
+    int? totalItems = 0;
+    string searchText = "";
+
+    Dictionary<string, object>? previousButtonAttributes = new Dictionary<string, object>();
+    Dictionary<string, object>? nextButtonAttributes = new Dictionary<string, object>();
+
+
+    protected override async Task OnInitializedAsync()
+    {
+        await GetUsersAsync();
+    }
+
+    private async Task PageSizeChanged(ChangeEventArgs args)
+    {
+        pageSize = int.Parse(args.Value!.ToString()!);
+        await GetUsersAsync();
+    }
+
+    private async Task GetUsersAsync()
+    {
+        await jsRuntime.InvokeVoidAsync("showLoader", null);
+
+        var usersData = await Http.GetFromJsonAsync<ResponseDto>("Users/Get?pageNo=" + pageNumber +
+        "&pageSize=" + pageSize);
+        users = (List<User>)usersData!.Users!;
+        totalItems = usersData.TotalItems;
+
+        await jsRuntime.InvokeVoidAsync("hideLoader", null);
+
+        if (pageNumber == 0)
+        {
+            if (!previousButtonAttributes!.ContainsKey("disabled"))
+            {
+                previousButtonAttributes.Add("disabled", "disabled");
+            }
+        }
+        else
+        {
+            previousButtonAttributes!.Remove("disabled");
+        }
+        if (pageNumber == Math.Floor((double)totalItems! / pageSize))
+        {
+            if (!nextButtonAttributes!.ContainsKey("disabled"))
+            {
+                nextButtonAttributes.Add("disabled", "disabled");
+            }
+        }
+        else
+        {
+            nextButtonAttributes!.Remove("disabled");
+        }
+    }
+
+    private async Task PreviousClicked()
+    {
+        pageNumber--;
+        await GetUsersAsync();
+    }
+    private async Task NextClicked()
+    {
+        pageNumber++;
+        await GetUsersAsync();
+    }
+
+    private void EditUser(int id)
+    {
+        navigationManager.NavigateTo($"/edit-user/{id}");
+    }
+
+    private async Task DeleteUser(long id)
+    {
+        var canDelete = await jsRuntime.InvokeAsync<bool>("showConfirmSwal", "Are you sure you want to delete this user?", "Yes, delete it.", "No, not now.");
+        if (canDelete)
+        {
+            await jsRuntime.InvokeVoidAsync("showLoader", null);
+            var result = await Http.DeleteFromJsonAsync<ResponseDto>($"users/delete/{id}");
+            await jsRuntime.InvokeVoidAsync("hideLoader", null);
+            if (result!.IsSuccess)
+            {
+                await jsRuntime.InvokeVoidAsync("showSwal", result.Message, true);
+                await GetUsersAsync();
+            }
+        }
+    }
+}
