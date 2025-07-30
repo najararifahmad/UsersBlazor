@@ -34,3 +34,46 @@ export interface Statistics {
   lowStockItems: number;
   categories: number;
 }
+
+// New Order-related types
+export interface Customer {
+  id: string;
+  name: string;
+  email?: string;
+  phone?: string;
+  address?: string;
+  createdAt: Date;
+}
+
+export interface OrderItem {
+  id: string;
+  inventoryItemId: string;
+  inventoryItemName: string;
+  quantity: number;
+  unitPrice: number;
+  totalPrice: number;
+}
+
+export interface Order {
+  id: string;
+  orderNumber: string;
+  customerId?: string;
+  customerName: string;
+  items: OrderItem[];
+  totalAmount: number;
+  status: 'pending' | 'processing' | 'shipped' | 'delivered' | 'cancelled';
+  orderDate: Date;
+  expectedDeliveryDate?: Date;
+  notes?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface OrderFilters {
+  searchText: string;
+  status?: string;
+  dateFrom?: Date;
+  dateTo?: Date;
+  sortBy: 'orderDate' | 'totalAmount' | 'status' | 'customerName';
+  sortOrder: 'asc' | 'desc';
+}
