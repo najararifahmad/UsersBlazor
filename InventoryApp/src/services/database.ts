@@ -18,6 +18,14 @@ interface SearchOptions {
   sortOrder?: 'ASC' | 'DESC';
 }
 
+// Sync status enum
+export enum SyncStatus {
+  SYNCED = 'synced',
+  PENDING = 'pending',
+  FAILED = 'failed',
+  CONFLICT = 'conflict'
+}
+
 class DatabaseService {
   private db: SQLite.WebSQLDatabase | null = null;
 
@@ -48,7 +56,12 @@ class DatabaseService {
               name TEXT NOT NULL,
               description TEXT,
               color TEXT NOT NULL,
-              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              sync_status TEXT DEFAULT 'pending',
+              last_synced_at DATETIME,
+              remote_id TEXT,
+              version INTEGER DEFAULT 1
             );
           `);
 
@@ -67,6 +80,10 @@ class DatabaseService {
               minimum_stock INTEGER,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              sync_status TEXT DEFAULT 'pending',
+              last_synced_at DATETIME,
+              remote_id TEXT,
+              version INTEGER DEFAULT 1,
               FOREIGN KEY (category_id) REFERENCES categories (id)
             );
           `);
@@ -79,7 +96,12 @@ class DatabaseService {
               email TEXT,
               phone TEXT,
               address TEXT,
-              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              sync_status TEXT DEFAULT 'pending',
+              last_synced_at DATETIME,
+              remote_id TEXT,
+              version INTEGER DEFAULT 1
             );
           `);
 
@@ -97,6 +119,10 @@ class DatabaseService {
               notes TEXT,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              sync_status TEXT DEFAULT 'pending',
+              last_synced_at DATETIME,
+              remote_id TEXT,
+              version INTEGER DEFAULT 1,
               FOREIGN KEY (customer_id) REFERENCES customers (id)
             );
           `);
@@ -111,8 +137,35 @@ class DatabaseService {
               quantity INTEGER NOT NULL,
               unit_price REAL NOT NULL,
               total_price REAL NOT NULL,
+              sync_status TEXT DEFAULT 'pending',
+              last_synced_at DATETIME,
+              remote_id TEXT,
+              version INTEGER DEFAULT 1,
               FOREIGN KEY (order_id) REFERENCES orders (id),
               FOREIGN KEY (inventory_item_id) REFERENCES inventory_items (id)
+            );
+          `);
+
+          // Sync log table for tracking sync operations
+          tx.executeSql(`
+            CREATE TABLE IF NOT EXISTS sync_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              operation TEXT NOT NULL,
+              sync_status TEXT NOT NULL,
+              error_message TEXT,
+              attempted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              completed_at DATETIME
+            );
+          `);
+
+          // App settings table for sync configuration
+          tx.executeSql(`
+            CREATE TABLE IF NOT EXISTS app_settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
           `);
 
@@ -120,9 +173,12 @@ class DatabaseService {
           tx.executeSql('CREATE INDEX IF NOT EXISTS idx_inventory_name ON inventory_items (name);');
           tx.executeSql('CREATE INDEX IF NOT EXISTS idx_inventory_category ON inventory_items (category_id);');
           tx.executeSql('CREATE INDEX IF NOT EXISTS idx_inventory_quantity ON inventory_items (quantity);');
+          tx.executeSql('CREATE INDEX IF NOT EXISTS idx_inventory_sync ON inventory_items (sync_status);');
           tx.executeSql('CREATE INDEX IF NOT EXISTS idx_orders_date ON orders (order_date);');
           tx.executeSql('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);');
           tx.executeSql('CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders (customer_id);');
+          tx.executeSql('CREATE INDEX IF NOT EXISTS idx_orders_sync ON orders (sync_status);');
+          tx.executeSql('CREATE INDEX IF NOT EXISTS idx_sync_log_entity ON sync_log (entity_type, entity_id);');
         },
         (error) => reject(error),
         () => resolve()
@@ -186,13 +242,13 @@ class DatabaseService {
       }
 
       const sql = ignoreIfExists 
-        ? 'INSERT OR IGNORE INTO categories (id, name, description, color) VALUES (?, ?, ?, ?)'
-        : 'INSERT INTO categories (id, name, description, color) VALUES (?, ?, ?, ?)';
+        ? 'INSERT OR IGNORE INTO categories (id, name, description, color, sync_status, version) VALUES (?, ?, ?, ?, ?, ?)'
+        : 'INSERT INTO categories (id, name, description, color, sync_status, version) VALUES (?, ?, ?, ?, ?, ?)';
 
       this.db.transaction((tx) => {
         tx.executeSql(
           sql,
-          [category.id, category.name, category.description || null, category.color],
+          [category.id, category.name, category.description || null, category.color, SyncStatus.PENDING, 1],
           () => resolve(),
           (_, error) => {
             reject(error);
@@ -203,7 +259,7 @@ class DatabaseService {
     });
   }
 
-  // Inventory Items Methods
+  // Inventory Items Methods with Sync Support
   async getInventoryItems(options: SearchOptions & PaginationOptions = {}): Promise<InventoryItem[]> {
     return new Promise((resolve, reject) => {
       if (!this.db) {
@@ -290,11 +346,6 @@ class DatabaseService {
     });
   }
 
-  async getInventoryItemById(id: string): Promise<InventoryItem | null> {
-    const items = await this.getInventoryItems({ searchText: undefined, limit: 1 });
-    return items.find(item => item.id === id) || null;
-  }
-
   async addInventoryItem(item: InventoryItem): Promise<void> {
     return new Promise((resolve, reject) => {
       if (!this.db) {
@@ -305,8 +356,8 @@ class DatabaseService {
       this.db.transaction((tx) => {
         tx.executeSql(
           `INSERT INTO inventory_items 
-           (id, name, description, category_id, quantity, unit_price, location, barcode, image_uri, minimum_stock, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, name, description, category_id, quantity, unit_price, location, barcode, image_uri, minimum_stock, created_at, updated_at, sync_status, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             item.id,
             item.name,
@@ -320,6 +371,8 @@ class DatabaseService {
             item.minimumStock || null,
             item.createdAt.toISOString(),
             item.updatedAt.toISOString(),
+            SyncStatus.PENDING,
+            1
           ],
           () => resolve(),
           (_, error) => {
@@ -342,7 +395,8 @@ class DatabaseService {
         tx.executeSql(
           `UPDATE inventory_items SET 
            name = ?, description = ?, category_id = ?, quantity = ?, unit_price = ?, 
-           location = ?, barcode = ?, image_uri = ?, minimum_stock = ?, updated_at = ?
+           location = ?, barcode = ?, image_uri = ?, minimum_stock = ?, updated_at = ?,
+           sync_status = ?, version = version + 1
            WHERE id = ?`,
           [
             item.name,
@@ -355,6 +409,7 @@ class DatabaseService {
             item.imageUri || null,
             item.minimumStock || null,
             new Date().toISOString(),
+            SyncStatus.PENDING,
             item.id,
           ],
           () => resolve(),
@@ -365,6 +420,178 @@ class DatabaseService {
         );
       });
     });
+  }
+
+  // Sync-related methods
+  async getPendingSyncItems(entityType: string, limit: number = 50): Promise<any[]> {
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      this.db.transaction((tx) => {
+        tx.executeSql(
+          `SELECT * FROM ${entityType} WHERE sync_status = ? LIMIT ?`,
+          [SyncStatus.PENDING, limit],
+          (_, result) => {
+            const items: any[] = [];
+            for (let i = 0; i < result.rows.length; i++) {
+              items.push(result.rows.item(i));
+            }
+            resolve(items);
+          },
+          (_, error) => {
+            reject(error);
+            return false;
+          }
+        );
+      });
+    });
+  }
+
+  async markItemSynced(entityType: string, localId: string, remoteId: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      this.db.transaction((tx) => {
+        tx.executeSql(
+          `UPDATE ${entityType} SET sync_status = ?, last_synced_at = ?, remote_id = ? WHERE id = ?`,
+          [SyncStatus.SYNCED, new Date().toISOString(), remoteId, localId],
+          () => resolve(),
+          (_, error) => {
+            reject(error);
+            return false;
+          }
+        );
+      });
+    });
+  }
+
+  async markItemSyncFailed(entityType: string, localId: string, errorMessage: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      this.db.transaction((tx) => {
+        tx.executeSql(
+          `UPDATE ${entityType} SET sync_status = ? WHERE id = ?`,
+          [SyncStatus.FAILED, localId],
+          () => {
+            // Log the sync failure
+            tx.executeSql(
+              `INSERT INTO sync_log (entity_type, entity_id, operation, sync_status, error_message, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              [entityType, localId, 'sync', SyncStatus.FAILED, errorMessage, new Date().toISOString()]
+            );
+          },
+          (_, error) => {
+            reject(error);
+            return false;
+          }
+        );
+      });
+    });
+  }
+
+  async getSyncStats(): Promise<{pending: number, failed: number, synced: number}> {
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      this.db.transaction((tx) => {
+        tx.executeSql(
+          `SELECT 
+            COUNT(CASE WHEN sync_status = 'pending' THEN 1 END) as pending,
+            COUNT(CASE WHEN sync_status = 'failed' THEN 1 END) as failed,
+            COUNT(CASE WHEN sync_status = 'synced' THEN 1 END) as synced
+           FROM (
+             SELECT sync_status FROM inventory_items
+             UNION ALL
+             SELECT sync_status FROM orders
+             UNION ALL
+             SELECT sync_status FROM customers
+             UNION ALL
+             SELECT sync_status FROM categories
+           )`,
+          [],
+          (_, result) => {
+            const row = result.rows.item(0);
+            resolve({
+              pending: row.pending || 0,
+              failed: row.failed || 0,
+              synced: row.synced || 0,
+            });
+          },
+          (_, error) => {
+            reject(error);
+            return false;
+          }
+        );
+      });
+    });
+  }
+
+  // App Settings for Sync Configuration
+  async getSetting(key: string): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      this.db.transaction((tx) => {
+        tx.executeSql(
+          'SELECT value FROM app_settings WHERE key = ?',
+          [key],
+          (_, result) => {
+            if (result.rows.length > 0) {
+              resolve(result.rows.item(0).value);
+            } else {
+              resolve(null);
+            }
+          },
+          (_, error) => {
+            reject(error);
+            return false;
+          }
+        );
+      });
+    });
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      this.db.transaction((tx) => {
+        tx.executeSql(
+          'INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)',
+          [key, value, new Date().toISOString()],
+          () => resolve(),
+          (_, error) => {
+            reject(error);
+            return false;
+          }
+        );
+      });
+    });
+  }
+
+  // Keep other methods from previous implementation...
+  async getInventoryItemById(id: string): Promise<InventoryItem | null> {
+    const items = await this.getInventoryItems({ searchText: undefined, limit: 1 });
+    return items.find(item => item.id === id) || null;
   }
 
   async deleteInventoryItem(id: string): Promise<void> {
@@ -388,159 +615,6 @@ class DatabaseService {
     });
   }
 
-  // Orders Methods
-  async getOrders(options: PaginationOptions = {}): Promise<Order[]> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error('Database not initialized'));
-        return;
-      }
-
-      let sql = 'SELECT * FROM orders ORDER BY order_date DESC';
-      const params: any[] = [];
-
-      if (options.limit) {
-        sql += ' LIMIT ?';
-        params.push(options.limit);
-        
-        if (options.offset) {
-          sql += ' OFFSET ?';
-          params.push(options.offset);
-        }
-      }
-
-      this.db.transaction((tx) => {
-        tx.executeSql(
-          sql,
-          params,
-          async (_, result) => {
-            const orders: Order[] = [];
-            
-            for (let i = 0; i < result.rows.length; i++) {
-              const row = result.rows.item(i);
-              const orderItems = await this.getOrderItems(row.id);
-              
-              orders.push({
-                id: row.id,
-                orderNumber: row.order_number,
-                customerId: row.customer_id,
-                customerName: row.customer_name,
-                items: orderItems,
-                totalAmount: row.total_amount,
-                status: row.status,
-                orderDate: new Date(row.order_date),
-                expectedDeliveryDate: row.expected_delivery_date ? new Date(row.expected_delivery_date) : undefined,
-                notes: row.notes,
-                createdAt: new Date(row.created_at),
-                updatedAt: new Date(row.updated_at),
-              });
-            }
-            resolve(orders);
-          },
-          (_, error) => {
-            reject(error);
-            return false;
-          }
-        );
-      });
-    });
-  }
-
-  private async getOrderItems(orderId: string): Promise<OrderItem[]> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error('Database not initialized'));
-        return;
-      }
-
-      this.db.transaction((tx) => {
-        tx.executeSql(
-          'SELECT * FROM order_items WHERE order_id = ?',
-          [orderId],
-          (_, result) => {
-            const items: OrderItem[] = [];
-            for (let i = 0; i < result.rows.length; i++) {
-              const row = result.rows.item(i);
-              items.push({
-                id: row.id,
-                inventoryItemId: row.inventory_item_id,
-                inventoryItemName: row.inventory_item_name,
-                quantity: row.quantity,
-                unitPrice: row.unit_price,
-                totalPrice: row.total_price,
-              });
-            }
-            resolve(items);
-          },
-          (_, error) => {
-            reject(error);
-            return false;
-          }
-        );
-      });
-    });
-  }
-
-  async addOrder(order: Order): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error('Database not initialized'));
-        return;
-      }
-
-      this.db.transaction(
-        (tx) => {
-          // Insert order
-          tx.executeSql(
-            `INSERT INTO orders 
-             (id, order_number, customer_id, customer_name, total_amount, status, order_date, expected_delivery_date, notes, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              order.id,
-              order.orderNumber,
-              order.customerId || null,
-              order.customerName,
-              order.totalAmount,
-              order.status,
-              order.orderDate.toISOString(),
-              order.expectedDeliveryDate?.toISOString() || null,
-              order.notes || null,
-              order.createdAt.toISOString(),
-              order.updatedAt.toISOString(),
-            ]
-          );
-
-          // Insert order items
-          for (const item of order.items) {
-            tx.executeSql(
-              `INSERT INTO order_items 
-               (id, order_id, inventory_item_id, inventory_item_name, quantity, unit_price, total_price)
-               VALUES (?, ?, ?, ?, ?, ?, ?)`,
-              [
-                item.id,
-                order.id,
-                item.inventoryItemId,
-                item.inventoryItemName,
-                item.quantity,
-                item.unitPrice,
-                item.totalPrice,
-              ]
-            );
-
-            // Update inventory quantity
-            tx.executeSql(
-              'UPDATE inventory_items SET quantity = quantity - ?, updated_at = ? WHERE id = ?',
-              [item.quantity, new Date().toISOString(), item.inventoryItemId]
-            );
-          }
-        },
-        (error) => reject(error),
-        () => resolve()
-      );
-    });
-  }
-
-  // Statistics Methods
   async getInventoryStats(): Promise<any> {
     return new Promise((resolve, reject) => {
       if (!this.db) {
@@ -575,7 +649,6 @@ class DatabaseService {
     });
   }
 
-  // Utility Methods
   async clearAllData(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (!this.db) {
@@ -590,6 +663,7 @@ class DatabaseService {
           tx.executeSql('DELETE FROM customers');
           tx.executeSql('DELETE FROM inventory_items');
           tx.executeSql('DELETE FROM categories');
+          tx.executeSql('DELETE FROM sync_log');
         },
         (error) => reject(error),
         () => resolve()
